@@ -69,10 +69,7 @@ impl BufferData {
 
 impl PartialEq for BufferData {
     fn eq(&self, other: &BufferData) -> bool {
-        if self.len != other.len {
-            return false;
-        }
-        unsafe { memory::memcmp(self.ptr, other.ptr, self.len) == 0 }
+        self.as_slice() == other.as_slice()
     }
 }
 
