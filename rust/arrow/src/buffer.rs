@@ -43,7 +43,7 @@ use crate::util::bit_util;
 /// The allocation is aligned at a 64-byte boundary, although due to slicing,
 /// it's possible that the first visible element may not be aligned on a
 /// 64-byte boundary.
-#[derive(PartialEq, Debug)]
+#[derive(Debug)]
 pub struct Buffer {
     /// Reference-counted pointer to the internal byte buffer.
     data: Arc<BufferData>,
@@ -260,6 +260,12 @@ impl Buffer {
             data: Arc::new(BufferData::empty()),
             offset: 0,
         }
+    }
+}
+
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Buffer) -> bool {
+        self.data() == other.data()
     }
 }
 
