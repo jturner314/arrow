@@ -60,6 +60,13 @@ struct BufferData {
     owned: bool,
 }
 
+impl BufferData {
+    /// Returns the contents of the buffer as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        std::slice::from_raw_parts(self.ptr, self.len)
+    }
+}
+
 impl PartialEq for BufferData {
     fn eq(&self, other: &BufferData) -> bool {
         if self.len != other.len {
@@ -80,19 +87,11 @@ impl Drop for BufferData {
 
 impl Debug for BufferData {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "BufferData {{ ptr: {:?}, len: {}, data: ",
-            self.ptr, self.len
-        )?;
-
-        unsafe {
-            f.debug_list()
-                .entries(std::slice::from_raw_parts(self.ptr, self.len).iter())
-                .finish()?;
-        }
-
-        write!(f, " }}")
+        f.debug_struct("BufferData")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .field("data", &self.as_slice())
+            .finish()
     }
 }
 
