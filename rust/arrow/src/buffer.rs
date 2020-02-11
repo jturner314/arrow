@@ -248,7 +248,7 @@ impl Buffer {
         assert!(memory::is_ptr_aligned::<T>(self.raw_data() as *const T));
         unsafe {
             std::slice::from_raw_parts(
-                mem::transmute::<*const u8, *const T>(self.raw_data()),
+                self.raw_data() as *const T,
                 self.len() / mem::size_of::<T>(),
             )
         }
