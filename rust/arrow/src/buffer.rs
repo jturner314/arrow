@@ -565,8 +565,10 @@ impl MutableBuffer {
         self.data.as_ptr()
     }
 
-    /// Freezes this buffer and return an immutable version of it.
+    /// Freezes this buffer and returns an immutable version of it.
     pub fn freeze(self) -> Buffer {
+        // We have to deallocate the excess capacity.
+        let ptr = unsafe { memory::reallocate(self.data, self.capacity, self.len) };
         let buffer_data = BufferData {
             ptr,
             len: self.len,
