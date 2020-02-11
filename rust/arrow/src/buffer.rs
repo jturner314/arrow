@@ -27,7 +27,6 @@ use std::fmt::{Debug, Formatter};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
 use std::mem;
 use std::ops::{BitAnd, BitOr, Not};
-use std::slice::from_raw_parts;
 use std::ptr::NonNull;
 #[cfg(feature = "simd")]
 use std::slice::from_raw_parts_mut;
@@ -247,10 +246,12 @@ impl Buffer {
     pub unsafe fn typed_data<T: ArrowNativeType + num::Num>(&self) -> &[T] {
         assert_eq!(self.len() % mem::size_of::<T>(), 0);
         assert!(memory::is_ptr_aligned::<T>(self.raw_data() as *const T));
-        from_raw_parts(
-            mem::transmute::<*const u8, *const T>(self.raw_data()),
-            self.len() / mem::size_of::<T>(),
-        )
+        unsafe {
+            std::slice::from_raw_parts(
+                mem::transmute::<*const u8, *const T>(self.raw_data()),
+                self.len() / mem::size_of::<T>(),
+            )
+        }
     }
 
     /// Returns an empty buffer.
@@ -296,10 +297,12 @@ where
     let mut result = MutableBuffer::new(left.len()).with_bitset(left.len(), false);
     let lanes = u8x64::lanes();
     for i in (0..left.len()).step_by(lanes) {
-        let left_data =
-            unsafe { from_raw_parts(left.raw_data().offset(i as isize), lanes) };
-        let right_data =
-            unsafe { from_raw_parts(right.raw_data().offset(i as isize), lanes) };
+        let left_data = unsafe {
+            std::slice::from_raw_parts(left.raw_data().offset(i as isize), lanes)
+        };
+        let right_data = unsafe {
+            std::slice::from_raw_parts(right.raw_data().offset(i as isize), lanes)
+        };
         let result_slice: &mut [u8] = unsafe {
             from_raw_parts_mut(
                 (result.data_mut().as_mut_ptr() as *mut u8).offset(i as isize),
@@ -393,7 +396,10 @@ impl Not for &Buffer {
             let lanes = u8x64::lanes();
             for i in (0..self.len()).step_by(lanes) {
                 unsafe {
-                    let data = from_raw_parts(self.raw_data().offset(i as isize), lanes);
+                    let data = std::slice::from_raw_parts(
+                        self.raw_data().offset(i as isize),
+                        lanes,
+                    );
                     let data_simd = u8x64::from_slice_unaligned_unchecked(data);
                     let simd_result = !data_simd;
                     let result_slice: &mut [u8] = from_raw_parts_mut(
