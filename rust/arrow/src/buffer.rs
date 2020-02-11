@@ -28,6 +28,7 @@ use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
 use std::mem;
 use std::ops::{BitAnd, BitOr, Not};
 use std::slice::from_raw_parts;
+use std::ptr::NonNull;
 #[cfg(feature = "simd")]
 use std::slice::from_raw_parts_mut;
 use std::sync::Arc;
@@ -38,8 +39,11 @@ use crate::error::{ArrowError, Result};
 use crate::memory;
 use crate::util::bit_util;
 
-/// Buffer is a contiguous memory region of fixed size and is aligned at a 64-byte
-/// boundary. Buffer is immutable.
+/// An immutable, contiguous, reference-counted memory region of fixed size.
+///
+/// The allocation is aligned at a 64-byte boundary, although due to slicing,
+/// it's possible that the first visible element may not be aligned on a
+/// 64-byte boundary.
 #[derive(PartialEq, Debug)]
 pub struct Buffer {
     /// Reference-counted pointer to the internal byte buffer.
@@ -51,7 +55,7 @@ pub struct Buffer {
 
 struct BufferData {
     /// The raw pointer into the buffer bytes
-    ptr: *const u8,
+    ptr: NonNull<u8>,
 
     /// The length (num of bytes) of the buffer
     len: usize,
@@ -63,7 +67,63 @@ struct BufferData {
 impl BufferData {
     /// Returns the contents of the buffer as a slice.
     pub fn as_slice(&self) -> &[u8] {
-        std::slice::from_raw_parts(self.ptr, self.len)
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Returns an empty buffer.
+    pub fn empty() -> Self {
+        BufferData {
+            ptr: memory::allocate_aligned(0),
+            len: 0,
+            owned: true,
+        }
+    }
+
+    /// Forms a `BufferData` from a pointer and a length.
+    ///
+    /// `owned` indicates whether the memory is owned by this `BufferData`. If
+    /// `true`, this `BufferData` will free the memory when dropped;
+    /// otherwise, it will skip freeing the memory.
+    ///
+    /// # Safety
+    ///
+    /// ## `owned` = `true` case
+    ///
+    /// In the case that `owned` is `true`, the following invariants must be
+    /// enforced by the caller:
+    ///
+    /// * `ptr` must have been previously allocated by one of the functions in
+    ///   [`memory`]
+    /// * `len` must be the size that `ptr` was allocated with
+    /// * nothing else uses the pointer after calling this function, since the
+    ///   ownership is transferred to the `BufferData`.
+    ///
+    /// ## `owned` = `false` case
+    ///
+    /// In the case that `owned` is `false`, the following invariants must be
+    /// enforced by the caller:
+    ///
+    /// * `ptr` must be [`ALIGNMENT`][memory::ALIGNMENT]-byte aligned
+    /// * all `len` bytes starting at `ptr` must be constant and readable for
+    ///   the lifetime of the `BufferData`
+    ///
+    /// **Warning**: Note that `BufferData` does not have a lifetime parameter
+    /// to help ensure that the data is valid for its lifetime. Be very careful
+    /// with this!
+    pub unsafe fn from_raw_parts_maybe_owned(
+        ptr: *const u8,
+        len: usize,
+        owned: bool,
+    ) -> Self {
+        debug_assert!(
+            memory::is_aligned(ptr, memory::ALIGNMENT),
+            "memory not aligned"
+        );
+        BufferData {
+            ptr: NonNull::new_unchecked(ptr as *mut u8),
+            len,
+            owned,
+        }
     }
 }
 
@@ -76,8 +136,10 @@ impl PartialEq for BufferData {
 /// Release the underlying memory when the current buffer goes out of scope
 impl Drop for BufferData {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.owned {
-            memory::free_aligned(self.ptr as *mut u8, self.len);
+        if self.owned {
+            unsafe {
+                memory::free_aligned(self.ptr, self.len);
+            }
         }
     }
 }
@@ -93,59 +155,46 @@ impl Debug for BufferData {
 }
 
 impl Buffer {
-    /// Creates a buffer from an existing memory region (must already be byte-aligned), this
-    /// `Buffer` will free this piece of memory when dropped.
+    /// Forms a `Buffer` from a pointer and a length.
     ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to raw parts
-    /// * `len` - Length of raw parts in **bytes**
+    /// This `Buffer` will free the memory when dropped (unless it's been
+    /// cloned, in which case the last `Buffer` referencing the data will free
+    /// it when dropped).
     ///
     /// # Safety
     ///
-    /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
-    /// bytes.
+    /// The following invariants must be enforced by the caller:
+    ///
+    /// * `ptr` must have been previously allocated by one of the functions in
+    ///   [`memory`]
+    /// * `len` must be the size that `ptr` was allocated with
+    /// * nothing else uses the pointer after calling this function, since the
+    ///   ownership is transferred to the `Buffer`.
     pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
-        Buffer::build_with_arguments(ptr, len, true)
-    }
-
-    /// Creates a buffer from an existing memory region (must already be byte-aligned), this
-    /// `Buffer` **does not** free this piece of memory when dropped.
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to raw parts
-    /// * `len` - Length of raw parts in **bytes**
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
-    /// bytes.
-    pub unsafe fn from_unowned(ptr: *const u8, len: usize) -> Self {
-        Buffer::build_with_arguments(ptr, len, false)
-    }
-
-    /// Creates a buffer from an existing memory region (must already be byte-aligned).
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to raw parts
-    /// * `len` - Length of raw parts in bytes
-    /// * `owned` - Whether the raw parts is owned by this `Buffer`. If true, this `Buffer` will
-    /// free this memory when dropped, otherwise it will skip freeing the raw parts.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
-    /// bytes.
-    unsafe fn build_with_arguments(ptr: *const u8, len: usize, owned: bool) -> Self {
-        assert!(
-            memory::is_aligned(ptr, memory::ALIGNMENT),
-            "memory not aligned"
-        );
-        let buf_data = BufferData { ptr, len, owned };
         Buffer {
-            data: Arc::new(buf_data),
+            data: Arc::new(BufferData::from_raw_parts_maybe_owned(ptr, len, true)),
+            offset: 0,
+        }
+    }
+
+    /// Forms a `Buffer` from a pointer and a length.
+    ///
+    /// **Note**: The `Buffer` will not free the memory when dropped.
+    ///
+    /// # Safety
+    ///
+    /// The following invariants must be enforced by the caller:
+    ///
+    /// * `ptr` must be [`ALIGNMENT`][memory::ALIGNMENT]-byte aligned
+    /// * all `len` bytes starting at `ptr` must be constant and readable for
+    ///   the lifetime of the `Buffer` (and all clones of this `Buffer`)
+    ///
+    /// **Warning**: Note that `Buffer` does not have a lifetime parameter to
+    /// help ensure that the data is valid for the appropriate lifetime. Be
+    /// very careful with this!
+    pub unsafe fn from_unowned(ptr: *const u8, len: usize) -> Self {
+        Buffer {
+            data: Arc::new(BufferData::from_raw_parts_maybe_owned(ptr, len, false)),
             offset: 0,
         }
     }
@@ -182,7 +231,7 @@ impl Buffer {
     /// Note that this should be used cautiously, and the returned pointer should not be
     /// stored anywhere, to avoid dangling pointers.
     pub fn raw_data(&self) -> *const u8 {
-        unsafe { self.data.ptr.offset(self.offset as isize) }
+        unsafe { self.data.ptr.as_ptr().offset(self.offset as isize) }
     }
 
     /// View buffer as typed slice.
@@ -206,7 +255,10 @@ impl Buffer {
 
     /// Returns an empty buffer.
     pub fn empty() -> Self {
-        unsafe { Self::from_raw_parts(::std::ptr::null(), 0) }
+        Buffer {
+            data: Arc::new(BufferData::empty()),
+            offset: 0,
+        }
     }
 }
 
@@ -227,7 +279,7 @@ impl<T: AsRef<[u8]>> From<T> for Buffer {
         let slice = p.as_ref();
         let len = slice.len() * mem::size_of::<u8>();
         let capacity = bit_util::round_upto_multiple_of_64(len);
-        let buffer = memory::allocate_aligned(capacity);
+        let buffer = memory::allocate_aligned(capacity).as_ptr();
         unsafe {
             memory::memcpy(buffer, slice.as_ptr(), len);
             Buffer::from_raw_parts(buffer, len)
@@ -373,9 +425,13 @@ unsafe impl Send for Buffer {}
 
 /// Similar to `Buffer`, but is growable and can be mutated. A mutable buffer can be
 /// converted into a immutable buffer via the `freeze` method.
+///
+/// This is analogous to `Vec<u8>`, except that the data is always
+/// [`ALIGNMENT`][memory::ALIGNMENT]-byte aligned and the capacity is always a
+/// multiple of [`ALIGNMENT`][memory::ALIGNMENT].
 #[derive(Debug)]
 pub struct MutableBuffer {
-    data: *mut u8,
+    data: NonNull<u8>,
     len: usize,
     capacity: usize,
 }
@@ -402,7 +458,7 @@ impl MutableBuffer {
         assert!(end <= self.capacity);
         let v = if val { 255 } else { 0 };
         unsafe {
-            std::ptr::write_bytes(self.data, v, end);
+            std::ptr::write_bytes(self.data.as_ptr(), v, end);
             self.len = end;
         }
         self
@@ -416,7 +472,7 @@ impl MutableBuffer {
     pub fn set_null_bits(&mut self, start: usize, count: usize) {
         assert!(start + count <= self.capacity);
         unsafe {
-            std::ptr::write_bytes(self.data.offset(start as isize), 0, count);
+            std::ptr::write_bytes(self.data.as_ptr().offset(start as isize), 0, count);
         }
     }
 
@@ -428,8 +484,9 @@ impl MutableBuffer {
         if capacity > self.capacity {
             let new_capacity = bit_util::round_upto_multiple_of_64(capacity);
             let new_capacity = cmp::max(new_capacity, self.capacity * 2);
-            let new_data = memory::reallocate(self.data, self.capacity, new_capacity);
-            self.data = new_data as *mut u8;
+            let new_data =
+                unsafe { memory::reallocate(self.data, self.capacity, new_capacity) };
+            self.data = new_data;
             self.capacity = new_capacity;
         }
         Ok(self.capacity)
@@ -448,8 +505,9 @@ impl MutableBuffer {
         } else {
             let new_capacity = bit_util::round_upto_multiple_of_64(new_len);
             if new_capacity < self.capacity {
-                let new_data = memory::reallocate(self.data, self.capacity, new_capacity);
-                self.data = new_data as *mut u8;
+                let new_data =
+                    unsafe { memory::reallocate(self.data, self.capacity, new_capacity) };
+                self.data = new_data;
                 self.capacity = new_capacity;
             }
         }
@@ -492,13 +550,13 @@ impl MutableBuffer {
     /// Note that this should be used cautiously, and the returned pointer should not be
     /// stored anywhere, to avoid dangling pointers.
     pub fn raw_data(&self) -> *const u8 {
-        self.data
+        self.data.as_ptr()
     }
 
     /// Freezes this buffer and return an immutable version of it.
     pub fn freeze(self) -> Buffer {
         let buffer_data = BufferData {
-            ptr: self.data,
+            ptr,
             len: self.len,
             owned: true,
         };
@@ -512,9 +570,7 @@ impl MutableBuffer {
 
 impl Drop for MutableBuffer {
     fn drop(&mut self) {
-        if !self.data.is_null() {
-            memory::free_aligned(self.data, self.capacity);
-        }
+        unsafe { memory::free_aligned(self.data, self.capacity) }
     }
 }
 
@@ -523,7 +579,7 @@ impl PartialEq for MutableBuffer {
         if self.len != other.len {
             return false;
         }
-        unsafe { memory::memcmp(self.data, other.data, self.len) == 0 }
+        unsafe { memory::memcmp(self.data.as_ptr(), other.data.as_ptr(), self.len) == 0 }
     }
 }
 
@@ -534,7 +590,11 @@ impl Write for MutableBuffer {
             return Err(IoError::new(ErrorKind::Other, "Buffer not big enough"));
         }
         unsafe {
-            memory::memcpy(self.data.offset(self.len as isize), buf.as_ptr(), buf.len());
+            memory::memcpy(
+                self.data.as_ptr().offset(self.len as isize),
+                buf.as_ptr(),
+                buf.len(),
+            );
             self.len += buf.len();
             Ok(buf.len())
         }
